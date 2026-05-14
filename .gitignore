@@ -1,0 +1,31 @@
+# Dependency directories
+node_modules/
+**/node_modules/
+
+# Environment variables and secrets
+.env
+.env.*
+*.local
+
+# Build output and distribution folders
+dist/
+build/
+out/
+frontend/dist/
+
+# Operating system files
+.DS_Store
+Thumbs.db
+*.log
+
+# Temporary runtime files and user uploads
+backend/temp_pdfs/
+backend/uploads/
+npm-debug.log*
+
+# IDEs and editors
+.idea/
+.vscode/
+*.suo
+*.ntvs*
+*.njsproj
