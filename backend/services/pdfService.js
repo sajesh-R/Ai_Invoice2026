@@ -242,7 +242,7 @@ const generatePDFKitFallback = (invoice, items, client, user, outputPath) => {
       doc.fillColor(mutedGrey).fontSize(10).font('Helvetica').text(`Due Date: ${new Date(invoice.due_date).toLocaleDateString()}`, 380, 90, { align: 'right' });
 
       // Divider
-      doc.moveTo(50, 120).lineTo(545, 120).strokeColor('#cbd5e1').strokeWidth(1).stroke();
+      doc.moveTo(50, 120).lineTo(545, 120).strokeColor('#cbd5e1').lineWidth(1).stroke();
 
       // --- Billing Details ---
       doc.fillColor(mutedGrey).fontSize(10).font('Helvetica-Bold').text('SENDER DETAILS', 50, 140);
@@ -265,7 +265,7 @@ const generatePDFKitFallback = (invoice, items, client, user, outputPath) => {
       doc.text('Tax %', 410, tableTop, { width: 50, align: 'center' });
       doc.text('Amount', 470, tableTop, { width: 75, align: 'right' });
 
-      doc.moveTo(50, tableTop + 15).lineTo(545, tableTop + 15).strokeColor(darkSlate).strokeWidth(1.5).stroke();
+      doc.moveTo(50, tableTop + 15).lineTo(545, tableTop + 15).strokeColor(darkSlate).lineWidth(1.5).stroke();
 
       let currentY = tableTop + 25;
       items.forEach((item, index) => {
@@ -278,7 +278,7 @@ const generatePDFKitFallback = (invoice, items, client, user, outputPath) => {
         doc.font('Helvetica-Bold').text(`₹${parseFloat(item.amount).toFixed(2)}`, 470, currentY, { width: 75, align: 'right' });
 
         currentY += 20;
-        doc.moveTo(50, currentY - 5).lineTo(545, currentY - 5).strokeColor('#e2e8f0').strokeWidth(0.5).stroke();
+        doc.moveTo(50, currentY - 5).lineTo(545, currentY - 5).strokeColor('#e2e8f0').lineWidth(0.5).stroke();
       });
 
       // --- Totals Summary ---
@@ -294,7 +294,7 @@ const generatePDFKitFallback = (invoice, items, client, user, outputPath) => {
       doc.fillColor(secondaryColor).font('Helvetica-Bold').text(`+₹${parseFloat(invoice.gst_vat_amount).toFixed(2)}`, 470, currentY, { width: 75, align: 'right' });
 
       currentY += 20;
-      doc.moveTo(340, currentY - 5).lineTo(545, currentY - 5).strokeColor('#cbd5e1').strokeWidth(1).stroke();
+      doc.moveTo(340, currentY - 5).lineTo(545, currentY - 5).strokeColor('#cbd5e1').lineWidth(1).stroke();
 
       doc.fillColor(darkSlate).fontSize(11).font('Helvetica-Bold');
       doc.text('Total Amount:', 340, currentY, { width: 120, align: 'right' });
