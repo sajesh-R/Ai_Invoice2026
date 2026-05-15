@@ -1,4 +1,6 @@
-const db = require('../config/db');
+const Payment = require('../models/Payment');
+const Invoice = require('../models/Invoice');
+const Client = require('../models/Client');
 
 const addPayment = async (req, res) => {
   const { invoice_id, payment_amount } = req.body;
@@ -12,17 +14,15 @@ const addPayment = async (req, res) => {
 
   try {
     // 1. Fetch and validate invoice
-    const invoiceQuery = 'SELECT * FROM invoices WHERE id = $1 AND user_id = $2';
-    const invoiceRes = await db.query(invoiceQuery, [invoice_id, userId]);
+    const invoice = await Invoice.findOne({ _id: invoice_id, user_id: userId });
 
-    if (invoiceRes.rowCount === 0) {
+    if (!invoice) {
       return res.status(404).json({ message: 'Invoice not found or unauthorized.' });
     }
 
-    const invoice = invoiceRes.rows[0];
-    const totalAmount = parseFloat(invoice.total_amount);
-    const oldPaidAmount = parseFloat(invoice.paid_amount);
-    const currentBalance = parseFloat(invoice.balance_amount);
+    const totalAmount = invoice.total_amount;
+    const oldPaidAmount = invoice.paid_amount;
+    const currentBalance = invoice.balance_amount;
 
     if (currentBalance <= 0) {
       return res.status(400).json({ message: 'This invoice has already been fully paid!' });
@@ -35,13 +35,11 @@ const addPayment = async (req, res) => {
     }
 
     // 2. Insert Payment Record
-    const insertPaymentQuery = `
-      INSERT INTO payments (invoice_id, payment_amount)
-      VALUES ($1, $2)
-      RETURNING *
-    `;
-    const paymentResult = await db.query(insertPaymentQuery, [invoice_id, paymentValue]);
-    const createdPayment = paymentResult.rows[0];
+    const payment = new Payment({
+      invoice_id,
+      payment_amount: paymentValue
+    });
+    await payment.save();
 
     // 3. Calculate new totals
     const newPaidAmount = oldPaidAmount + paymentValue;
@@ -54,19 +52,10 @@ const addPayment = async (req, res) => {
     }
 
     // 4. Update Invoice totals & status
-    const updateInvoiceQuery = `
-      UPDATE invoices
-      SET paid_amount = $1, balance_amount = $2, status = $3
-      WHERE id = $4
-      RETURNING *
-    `;
-    const updatedInvoiceResult = await db.query(updateInvoiceQuery, [
-      newPaidAmount,
-      newBalanceAmount,
-      newStatus,
-      invoice_id
-    ]);
-    const updatedInvoice = updatedInvoiceResult.rows[0];
+    invoice.paid_amount = newPaidAmount;
+    invoice.balance_amount = newBalanceAmount;
+    invoice.status = newStatus;
+    await invoice.save();
 
     // 5. Trigger PDF regeneration to reflect the new payment details
     try {
@@ -76,10 +65,16 @@ const addPayment = async (req, res) => {
       console.error(`Background PDF update failed: ${bgErr.message}`);
     }
 
+    const paymentData = payment.toObject();
+    paymentData.id = paymentData._id;
+
+    const invoiceData = invoice.toObject();
+    invoiceData.id = invoiceData._id;
+
     return res.status(201).json({
       message: 'Payment recorded successfully!',
-      payment: createdPayment,
-      invoice: updatedInvoice
+      payment: paymentData,
+      invoice: invoiceData
     });
   } catch (error) {
     console.error(`Add Payment Error: ${error.message}`);
@@ -94,28 +89,20 @@ const regeneratePDFInBackground = async (invoiceId, userId) => {
   const { generateInvoicePDF } = require('../services/pdfService');
   const { uploadPDF } = require('../config/cloudinary');
   const fs = require('fs');
+  const User = require('../models/User');
+  const InvoiceItem = require('../models/InvoiceItem');
 
   try {
-    const invoiceQuery = 'SELECT * FROM invoices WHERE id = $1 AND user_id = $2';
-    const invoiceRes = await db.query(invoiceQuery, [invoiceId, userId]);
-    const invoice = invoiceRes.rows[0];
-
-    const clientQuery = 'SELECT * FROM clients WHERE id = $1';
-    const clientRes = await db.query(clientQuery, [invoice.client_id]);
-    const client = clientRes.rows[0];
-
-    const userQuery = 'SELECT name, email FROM users WHERE id = $1';
-    const userRes = await db.query(userQuery, [userId]);
-    const user = userRes.rows[0];
-
-    const itemsQuery = 'SELECT * FROM invoice_items WHERE invoice_id = $1';
-    const itemsRes = await db.query(itemsQuery, [invoiceId]);
-    const items = itemsRes.rows;
+    const invoice = await Invoice.findOne({ _id: invoiceId, user_id: userId });
+    const client = await Client.findById(invoice.client_id);
+    const user = await User.findById(userId).select('name email');
+    const items = await InvoiceItem.find({ invoice_id: invoiceId });
 
     const pdfLocalPath = await generateInvoicePDF(invoice, items, client, user);
     const pdfUrl = await uploadPDF(pdfLocalPath);
 
-    await db.query('UPDATE invoices SET pdf_path = $1 WHERE id = $2', [pdfUrl, invoiceId]);
+    invoice.pdf_path = pdfUrl;
+    await invoice.save();
     
     if (pdfLocalPath && fs.existsSync(pdfLocalPath)) {
       try { fs.unlinkSync(pdfLocalPath); } catch (e) {}
@@ -130,16 +117,26 @@ const getPayments = async (req, res) => {
   const userId = req.user.id;
 
   try {
-    const fetchQuery = `
-      SELECT payments.*, invoices.invoice_number, clients.name as client_name
-      FROM payments
-      JOIN invoices ON payments.invoice_id = invoices.id
-      JOIN clients ON invoices.client_id = clients.id
-      WHERE invoices.user_id = $1
-      ORDER BY payments.id DESC
-    `;
-    const result = await db.query(fetchQuery, [userId]);
-    return res.json({ payments: result.rows });
+    // We need to fetch all invoices for the user, then get their IDs, and find payments for those invoices
+    const userInvoices = await Invoice.find({ user_id: userId }).populate('client_id');
+    const invoiceMap = {};
+    const invoiceIds = userInvoices.map(inv => {
+      invoiceMap[inv._id.toString()] = inv;
+      return inv._id;
+    });
+
+    const payments = await Payment.find({ invoice_id: { $in: invoiceIds } }).sort({ _id: -1 });
+
+    const formattedPayments = payments.map(payment => {
+      const p = payment.toObject();
+      const inv = invoiceMap[payment.invoice_id.toString()];
+      p.id = p._id;
+      p.invoice_number = inv ? inv.invoice_number : 'Unknown';
+      p.client_name = (inv && inv.client_id) ? inv.client_id.name : 'Unknown';
+      return p;
+    });
+
+    return res.json({ payments: formattedPayments });
   } catch (error) {
     console.error(`Get Payments Error: ${error.message}`);
     return res.status(500).json({ message: 'Internal server error fetching billing logs.' });

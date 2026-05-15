@@ -1,8 +1,14 @@
 const cron = require('node-cron');
-const db = require('../config/db');
 const { generateInvoicePDF } = require('./pdfService');
 const { uploadPDF } = require('../config/cloudinary');
 const { sendInvoiceEmail, getInvoiceEmailBody } = require('./emailService');
+const fs = require('fs');
+
+const RecurringInvoice = require('../models/RecurringInvoice');
+const Invoice = require('../models/Invoice');
+const InvoiceItem = require('../models/InvoiceItem');
+const Client = require('../models/Client');
+const User = require('../models/User');
 
 /**
  * Utility to calculate the next date based on billing cycle
@@ -37,30 +43,27 @@ const calculateNextBillingDate = (dateStr, billingCycle) => {
 const processRecurringInvoices = async () => {
   console.log("⏰ Running Scheduler: Processing Recurring Invoices...");
   const todayStr = new Date().toISOString().split('T')[0];
+  const todayDate = new Date(todayStr);
 
   try {
     // 1. Fetch active recurring schedules that are due
-    const recurringQuery = `
-      SELECT ri.*, c.name as client_name, c.email as client_email, c.address as client_address, c.phone as client_phone,
-             u.name as user_name, u.email as user_email
-      FROM recurring_invoices ri
-      JOIN clients c ON ri.client_id = c.id
-      JOIN users u ON ri.user_id = u.id
-      WHERE ri.status = 'Active' AND ri.next_invoice_date <= $1
-    `;
-    const schedules = await db.query(recurringQuery, [todayStr]);
-    console.log(`Found ${schedules.rowCount} recurring invoice schedule(s) to process.`);
+    const schedules = await RecurringInvoice.find({
+      status: 'Active',
+      next_invoice_date: { $lte: todayDate }
+    }).populate('client_id').populate('user_id');
 
-    for (const ri of schedules.rows) {
-      console.log(`Processing schedule ID ${ri.id} for Client "${ri.client_name}"...`);
+    console.log(`Found ${schedules.length} recurring invoice schedule(s) to process.`);
+
+    for (const ri of schedules) {
+      if (!ri.client_id || !ri.user_id) continue;
+      
+      console.log(`Processing schedule ID ${ri._id} for Client "${ri.client_id.name}"...`);
 
       // 2. Generate a sequential invoice number
-      // Let's find the latest invoice number to increment
-      const countRes = await db.query("SELECT invoice_number FROM invoices ORDER BY id DESC LIMIT 1");
+      const latestInvoice = await Invoice.findOne().sort({ _id: -1 });
       let nextNumberSeq = 1;
-      if (countRes.rowCount > 0) {
-        const lastNum = countRes.rows[0].invoice_number;
-        const matches = lastNum.match(/\d+$/);
+      if (latestInvoice && latestInvoice.invoice_number) {
+        const matches = latestInvoice.invoice_number.match(/\d+$/);
         if (matches) {
           nextNumberSeq = parseInt(matches[0]) + 1;
         }
@@ -70,77 +73,68 @@ const processRecurringInvoices = async () => {
       // 3. Setup Invoice details (Retainer Fees)
       const description = `Retainer Service Fee - ${ri.billing_cycle} Cycle`;
       const quantity = 1;
-      const rate = 1500.00; // Standard demo rate for retainers, or we can look up past client invoices!
-      const gstPercentage = 18.00; // Standard 18% tax
+      const rate = 1500.00; // Standard demo rate
+      const gstPercentage = 18.00;
       const taxAmount = (rate * quantity) * (gstPercentage / 100);
       const totalAmount = (rate * quantity) + taxAmount;
 
       const dueDate = new Date();
-      dueDate.setDate(dueDate.getDate() + 14); // 14-day payment terms
-      const dueDateStr = dueDate.toISOString().split('T')[0];
+      dueDate.setDate(dueDate.getDate() + 14);
 
       // 4. Create Invoice Record
-      const insertInvoiceQuery = `
-        INSERT INTO invoices (user_id, invoice_number, client_id, total_amount, gst_vat_amount, paid_amount, balance_amount, status, due_date)
-        VALUES ($1, $2, $3, $4, $5, 0.00, $4, 'Unpaid', $6)
-        RETURNING *
-      `;
-      const invoiceRes = await db.query(insertInvoiceQuery, [
-        ri.user_id,
-        newInvoiceNumber,
-        ri.client_id,
-        totalAmount,
-        taxAmount,
-        dueDateStr
-      ]);
-      const newInvoice = invoiceRes.rows[0];
+      const newInvoice = new Invoice({
+        user_id: ri.user_id._id,
+        invoice_number: newInvoiceNumber,
+        client_id: ri.client_id._id,
+        total_amount: totalAmount,
+        gst_vat_amount: taxAmount,
+        paid_amount: 0.00,
+        balance_amount: totalAmount,
+        status: 'Unpaid',
+        due_date: dueDate
+      });
+      await newInvoice.save();
 
       // 5. Create Invoice Item Record
-      const insertItemQuery = `
-        INSERT INTO invoice_items (invoice_id, description, quantity, rate, gst_vat_percentage, amount)
-        VALUES ($1, $2, $3, $4, $5, $6)
-        RETURNING *
-      `;
-      const itemRes = await db.query(insertItemQuery, [
-        newInvoice.id,
+      const invoiceItem = new InvoiceItem({
+        invoice_id: newInvoice._id,
         description,
         quantity,
         rate,
-        gstPercentage,
-        rate * quantity
-      ]);
-      const invoiceItems = itemRes.rows;
+        gst_vat_percentage: gstPercentage,
+        amount: rate * quantity
+      });
+      await invoiceItem.save();
 
-      // Prepare records for PDF generator
-      const client = { name: ri.client_name, email: ri.client_email, address: ri.client_address, phone: ri.client_phone };
-      const user = { name: ri.user_name, email: ri.user_email };
+      const invoiceItems = [invoiceItem.toObject()];
+      const client = ri.client_id.toObject();
+      const user = ri.user_id.toObject();
 
       // 6. Generate PDF
-      const pdfLocalPath = await generateInvoicePDF(newInvoice, invoiceItems, client, user);
+      const pdfLocalPath = await generateInvoicePDF(newInvoice.toObject(), invoiceItems, client, user);
       
-      // 7. Store PDF Reference (Cloudinary or local)
+      // 7. Store PDF Reference
       const pdfPublicUrl = await uploadPDF(pdfLocalPath);
-      await db.query("UPDATE invoices SET pdf_path = $1 WHERE id = $2", [pdfPublicUrl, newInvoice.id]);
       newInvoice.pdf_path = pdfPublicUrl;
+      await newInvoice.save();
 
       // 8. One-Click Email Delivery
       const emailSubject = `New Recurring Invoice ${newInvoice.invoice_number} from ${user.name}`;
-      const emailBody = getInvoiceEmailBody(newInvoice, client, user);
+      const emailBody = getInvoiceEmailBody(newInvoice.toObject(), client, user);
       await sendInvoiceEmail(client.email, client.name, emailSubject, emailBody, pdfLocalPath);
 
       // 9. Update Recurring Invoice Schedule Dates
       const nextDateStr = calculateNextBillingDate(ri.next_invoice_date, ri.billing_cycle);
-      await db.query(
-        "UPDATE recurring_invoices SET next_invoice_date = $1, last_generated_date = $2 WHERE id = $3",
-        [nextDateStr, todayStr, ri.id]
-      );
+      ri.next_invoice_date = new Date(nextDateStr);
+      ri.last_generated_date = todayDate;
+      await ri.save();
 
       // Cleanup temp local PDF
       if (fs.existsSync(pdfLocalPath)) {
         try { fs.unlinkSync(pdfLocalPath); } catch (e) {}
       }
 
-      console.log(`Schedule ID ${ri.id} processed successfully. Next generation date: ${nextDateStr}`);
+      console.log(`Schedule ID ${ri._id} processed successfully. Next generation date: ${nextDateStr}`);
     }
   } catch (error) {
     console.error("Failed to run recurring invoices job:", error.message);
@@ -153,33 +147,36 @@ const processRecurringInvoices = async () => {
 const processOverdueReminders = async () => {
   console.log("⏰ Running Scheduler: Processing Overdue Reminders...");
   const todayStr = new Date().toISOString().split('T')[0];
+  const todayDate = new Date(todayStr);
 
   try {
     // 1. Mark unpaid and partially paid invoices past due date as Overdue
-    const updateStatusQuery = `
-      UPDATE invoices
-      SET status = 'Overdue'
-      WHERE status IN ('Unpaid', 'Partially Paid') AND due_date < $1
-    `;
-    const statusUpdateRes = await db.query(updateStatusQuery, [todayStr]);
-    if (statusUpdateRes.rowCount > 0) {
-      console.log(`Updated ${statusUpdateRes.rowCount} invoice(s) status to "Overdue".`);
+    const updateResult = await Invoice.updateMany(
+      { 
+        status: { $in: ['Unpaid', 'Partially Paid'] },
+        due_date: { $lt: todayDate }
+      },
+      { $set: { status: 'Overdue' } }
+    );
+    
+    if (updateResult.modifiedCount > 0) {
+      console.log(`Updated ${updateResult.modifiedCount} invoice(s) status to "Overdue".`);
     }
 
     // 2. Find overdue invoices and email reminders
-    const overdueQuery = `
-      SELECT i.*, c.name as client_name, c.email as client_email,
-             u.name as user_name, u.email as user_email
-      FROM invoices i
-      JOIN clients c ON i.client_id = c.id
-      JOIN users u ON i.user_id = u.id
-      WHERE i.status = 'Overdue'
-    `;
-    const overdueInvoices = await db.query(overdueQuery);
-    console.log(`Found ${overdueInvoices.rowCount} overdue invoice(s) to send reminders for.`);
+    const overdueInvoices = await Invoice.find({ status: 'Overdue' })
+      .populate('client_id')
+      .populate('user_id');
+      
+    console.log(`Found ${overdueInvoices.length} overdue invoice(s) to send reminders for.`);
 
-    for (const inv of overdueInvoices.rows) {
-      console.log(`Sending reminder for invoice ${inv.invoice_number} to ${inv.client_email}...`);
+    for (const inv of overdueInvoices) {
+      if (!inv.client_id || !inv.user_id) continue;
+
+      const client = inv.client_id;
+      const user = inv.user_id;
+
+      console.log(`Sending reminder for invoice ${inv.invoice_number} to ${client.email}...`);
 
       const emailSubject = `⚠️ OVERDUE PAYMENT REMINDER: Invoice ${inv.invoice_number}`;
       const emailBody = `
@@ -189,7 +186,7 @@ const processOverdueReminders = async () => {
             <p style="margin: 5px 0 0 0; font-size: 13px; opacity: 0.9;">Invoice ${inv.invoice_number}</p>
           </div>
           <div style="padding: 20px 30px;">
-            <p style="font-size: 16px; color: #1e293b; margin-top: 0;">Dear <strong>${inv.client_name}</strong>,</p>
+            <p style="font-size: 16px; color: #1e293b; margin-top: 0;">Dear <strong>${client.name}</strong>,</p>
             <p style="font-size: 14px; color: #475569; line-height: 1.6;">
               This is a friendly but urgent notification that payment for invoice <strong>${inv.invoice_number}</strong> is now overdue. 
               The original due date was <strong>${new Date(inv.due_date).toLocaleDateString()}</strong>.
@@ -222,14 +219,14 @@ const processOverdueReminders = async () => {
 
             <p style="font-size: 14px; color: #475569; margin-top: 30px; border-top: 1px solid #f1f5f9; padding-top: 20px;">
               Thank you,<br>
-              <strong>${inv.user_name}</strong><br>
-              <span style="font-size: 12px; color: #94a3b8;">${inv.user_email}</span>
+              <strong>${user.name}</strong><br>
+              <span style="font-size: 12px; color: #94a3b8;">${user.email}</span>
             </p>
           </div>
         </div>
       `;
 
-      await sendInvoiceEmail(inv.client_email, inv.client_name, emailSubject, emailBody);
+      await sendInvoiceEmail(client.email, client.name, emailSubject, emailBody);
     }
   } catch (error) {
     console.error("Failed to run overdue reminders job:", error.message);

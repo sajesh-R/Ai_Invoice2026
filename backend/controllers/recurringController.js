@@ -1,4 +1,5 @@
-const db = require('../config/db');
+const RecurringInvoice = require('../models/RecurringInvoice');
+const Client = require('../models/Client');
 const { processRecurringInvoices, processOverdueReminders } = require('../services/cronService');
 
 const createRecurringSchedule = async (req, res) => {
@@ -16,22 +17,26 @@ const createRecurringSchedule = async (req, res) => {
 
   try {
     // Validate client belongs to user
-    const clientQuery = 'SELECT id FROM clients WHERE id = $1 AND user_id = $2';
-    const clientRes = await db.query(clientQuery, [client_id, userId]);
-    if (clientRes.rowCount === 0) {
+    const client = await Client.findOne({ _id: client_id, user_id: userId });
+    if (!client) {
       return res.status(404).json({ message: 'Client not found or unauthorized.' });
     }
 
-    const insertQuery = `
-      INSERT INTO recurring_invoices (user_id, client_id, billing_cycle, next_invoice_date, status)
-      VALUES ($1, $2, $3, $4, 'Active')
-      RETURNING *
-    `;
-    const result = await db.query(insertQuery, [userId, client_id, billing_cycle, next_invoice_date]);
+    const schedule = new RecurringInvoice({
+      user_id: userId,
+      client_id,
+      billing_cycle,
+      next_invoice_date,
+      status: 'Active'
+    });
+    await schedule.save();
     
+    const scheduleData = schedule.toObject();
+    scheduleData.id = scheduleData._id;
+
     return res.status(201).json({
       message: 'Recurring billing schedule created successfully!',
-      schedule: result.rows[0]
+      schedule: scheduleData
     });
   } catch (error) {
     console.error(`Create Recurring Schedule Error: ${error.message}`);
@@ -43,15 +48,19 @@ const getRecurringSchedules = async (req, res) => {
   const userId = req.user.id;
 
   try {
-    const fetchQuery = `
-      SELECT ri.*, clients.name as client_name, clients.email as client_email
-      FROM recurring_invoices ri
-      JOIN clients ON ri.client_id = clients.id
-      WHERE ri.user_id = $1
-      ORDER BY ri.id DESC
-    `;
-    const result = await db.query(fetchQuery, [userId]);
-    return res.json({ schedules: result.rows });
+    const schedules = await RecurringInvoice.find({ user_id: userId })
+      .populate('client_id')
+      .sort({ _id: -1 });
+
+    const formattedSchedules = schedules.map(schedule => {
+      const s = schedule.toObject();
+      s.id = s._id;
+      s.client_name = s.client_id ? s.client_id.name : 'Unknown';
+      s.client_email = s.client_id ? s.client_id.email : 'Unknown';
+      return s;
+    });
+
+    return res.json({ schedules: formattedSchedules });
   } catch (error) {
     console.error(`Get Recurring Schedules Error: ${error.message}`);
     return res.status(500).json({ message: 'Internal server error while fetching recurring schedules.' });

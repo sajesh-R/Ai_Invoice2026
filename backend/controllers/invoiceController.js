@@ -1,24 +1,26 @@
-const db = require('../config/db');
+const Invoice = require('../models/Invoice');
+const InvoiceItem = require('../models/InvoiceItem');
+const Client = require('../models/Client');
+const User = require('../models/User');
+const Payment = require('../models/Payment');
 const { generateInvoicePDF } = require('../services/pdfService');
 const { uploadPDF } = require('../config/cloudinary');
 const { sendInvoiceEmail, getInvoiceEmailBody } = require('../services/emailService');
 const { generateInvoiceDraftFromPrompt } = require('../services/aiService');
 const fs = require('fs');
 
-
 /**
  * Helper to generate sequential invoice numbers
  */
 const generateNextInvoiceNumber = async () => {
   try {
-    const fetchLatestQuery = 'SELECT invoice_number FROM invoices ORDER BY id DESC LIMIT 1';
-    const result = await db.query(fetchLatestQuery);
+    const latestInvoice = await Invoice.findOne().sort({ _id: -1 });
     
     let currentYear = new Date().getFullYear();
     let nextNum = 1;
     
-    if (result.rowCount > 0) {
-      const lastInvoiceNum = result.rows[0].invoice_number; // e.g. INV-2026-0005
+    if (latestInvoice && latestInvoice.invoice_number) {
+      const lastInvoiceNum = latestInvoice.invoice_number; // e.g. INV-2026-0005
       const parts = lastInvoiceNum.split('-');
       if (parts.length === 3) {
         const lastYear = parseInt(parts[1]);
@@ -48,16 +50,12 @@ const createInvoice = async (req, res) => {
 
   try {
     // 1. Fetch Client and User details to ensure they exist & for PDF printing
-    const clientQuery = 'SELECT * FROM clients WHERE id = $1 AND user_id = $2';
-    const clientRes = await db.query(clientQuery, [client_id, userId]);
-    if (clientRes.rowCount === 0) {
+    const client = await Client.findOne({ _id: client_id, user_id: userId });
+    if (!client) {
       return res.status(404).json({ message: 'Client not found or unauthorized.' });
     }
-    const client = clientRes.rows[0];
 
-    const userQuery = 'SELECT name, email FROM users WHERE id = $1';
-    const userRes = await db.query(userQuery, [userId]);
-    const user = userRes.rows[0];
+    const user = await User.findById(userId).select('name email');
 
     // 2. Generate sequential invoice number
     const invoiceNumber = await generateNextInvoiceNumber();
@@ -82,55 +80,49 @@ const createInvoice = async (req, res) => {
         quantity,
         rate,
         gst_vat_percentage: taxPercentage,
-        amount: subtotal // Amount field inside items table (excluding tax as per schema, or total)
+        amount: subtotal
       };
     });
 
     // 4. Save Invoice Record to DB
-    const insertInvoiceQuery = `
-      INSERT INTO invoices (user_id, invoice_number, client_id, total_amount, gst_vat_amount, paid_amount, balance_amount, status, due_date)
-      VALUES ($1, $2, $3, $4, $5, 0.00, $4, 'Unpaid', $6)
-      RETURNING *
-    `;
-    const invoiceResult = await db.query(insertInvoiceQuery, [
-      userId,
-      invoiceNumber,
+    const invoice = new Invoice({
+      user_id: userId,
+      invoice_number: invoiceNumber,
       client_id,
-      totalAmount,
-      gstVatAmount,
+      total_amount: totalAmount,
+      gst_vat_amount: gstVatAmount,
+      paid_amount: 0.00,
+      balance_amount: totalAmount,
+      status: 'Unpaid',
       due_date
-    ]);
-    const createdInvoice = invoiceResult.rows[0];
+    });
+    await invoice.save();
 
     // 5. Save Line Items to DB
     const itemPromises = itemsWithCalculatedAmounts.map(item => {
-      const insertItemQuery = `
-        INSERT INTO invoice_items (invoice_id, description, quantity, rate, gst_vat_percentage, amount)
-        VALUES ($1, $2, $3, $4, $5, $6)
-        RETURNING *
-      `;
-      return db.query(insertItemQuery, [
-        createdInvoice.id,
-        item.description,
-        item.quantity,
-        item.rate,
-        item.gst_vat_percentage,
-        item.amount
-      ]);
+      const invoiceItem = new InvoiceItem({
+        invoice_id: invoice._id,
+        description: item.description,
+        quantity: item.quantity,
+        rate: item.rate,
+        gst_vat_percentage: item.gst_vat_percentage,
+        amount: item.amount
+      });
+      return invoiceItem.save();
     });
-    const itemsResult = await Promise.all(itemPromises);
-    const savedItems = itemsResult.map(res => res.rows[0]);
+    const savedItemsDocs = await Promise.all(itemPromises);
+    const savedItems = savedItemsDocs.map(doc => doc.toObject());
 
     // 6. Generate PDF in background/immediately
     let pdfLocalPath = '';
     let pdfUrl = '';
     try {
-      pdfLocalPath = await generateInvoicePDF(createdInvoice, savedItems, client, user);
+      pdfLocalPath = await generateInvoicePDF(invoice, savedItems, client, user);
       pdfUrl = await uploadPDF(pdfLocalPath);
       
       // Update Invoice PDF URL
-      await db.query('UPDATE invoices SET pdf_path = $1 WHERE id = $2', [pdfUrl, createdInvoice.id]);
-      createdInvoice.pdf_path = pdfUrl;
+      invoice.pdf_path = pdfUrl;
+      await invoice.save();
     } catch (pdfErr) {
       console.error(`Automated PDF Generation failed inside creation pipeline: ${pdfErr.message}`);
     } finally {
@@ -139,6 +131,10 @@ const createInvoice = async (req, res) => {
         try { fs.unlinkSync(pdfLocalPath); } catch (e) {}
       }
     }
+
+    const createdInvoice = invoice.toObject();
+    createdInvoice.id = createdInvoice._id;
+    savedItems.forEach(i => i.id = i._id);
 
     return res.status(201).json({
       message: 'Invoice created successfully!',
@@ -155,15 +151,19 @@ const getInvoices = async (req, res) => {
   const userId = req.user.id;
 
   try {
-    const fetchQuery = `
-      SELECT invoices.*, clients.name as client_name, clients.email as client_email
-      FROM invoices
-      JOIN clients ON invoices.client_id = clients.id
-      WHERE invoices.user_id = $1
-      ORDER BY invoices.id DESC
-    `;
-    const result = await db.query(fetchQuery, [userId]);
-    return res.json({ invoices: result.rows });
+    const invoices = await Invoice.find({ user_id: userId })
+      .populate('client_id')
+      .sort({ _id: -1 });
+
+    const formattedInvoices = invoices.map(invoice => {
+      const inv = invoice.toObject();
+      inv.id = inv._id;
+      inv.client_name = inv.client_id ? inv.client_id.name : 'Unknown';
+      inv.client_email = inv.client_id ? inv.client_id.email : 'Unknown';
+      return inv;
+    });
+
+    return res.json({ invoices: formattedInvoices });
   } catch (error) {
     console.error(`Get Invoices Error: ${error.message}`);
     return res.status(500).json({ message: 'Internal server error fetching invoices.' });
@@ -176,32 +176,39 @@ const getInvoiceDetails = async (req, res) => {
 
   try {
     // Fetch Invoice
-    const invoiceQuery = `
-      SELECT invoices.*, clients.name as client_name, clients.email as client_email, clients.phone as client_phone, clients.address as client_address
-      FROM invoices
-      JOIN clients ON invoices.client_id = clients.id
-      WHERE invoices.id = $1 AND invoices.user_id = $2
-    `;
-    const invoiceRes = await db.query(invoiceQuery, [id, userId]);
+    const invoice = await Invoice.findOne({ _id: id, user_id: userId }).populate('client_id');
 
-    if (invoiceRes.rowCount === 0) {
+    if (!invoice) {
       return res.status(404).json({ message: 'Invoice not found or access denied.' });
     }
 
-    const invoice = invoiceRes.rows[0];
+    const invData = invoice.toObject();
+    invData.id = invData._id;
+    invData.client_name = invData.client_id ? invData.client_id.name : 'Unknown';
+    invData.client_email = invData.client_id ? invData.client_id.email : 'Unknown';
+    invData.client_phone = invData.client_id ? invData.client_id.phone : '';
+    invData.client_address = invData.client_id ? invData.client_id.address : '';
 
     // Fetch Line Items
-    const itemsQuery = 'SELECT * FROM invoice_items WHERE invoice_id = $1 ORDER BY id ASC';
-    const itemsRes = await db.query(itemsQuery, [id]);
+    const items = await InvoiceItem.find({ invoice_id: id }).sort({ _id: 1 });
+    const formattedItems = items.map(i => {
+      const item = i.toObject();
+      item.id = item._id;
+      return item;
+    });
 
     // Fetch Payments
-    const paymentsQuery = 'SELECT * FROM payments WHERE invoice_id = $1 ORDER BY payment_date DESC';
-    const paymentsRes = await db.query(paymentsQuery, [id]);
+    const payments = await Payment.find({ invoice_id: id }).sort({ payment_date: -1 });
+    const formattedPayments = payments.map(p => {
+      const payment = p.toObject();
+      payment.id = payment._id;
+      return payment;
+    });
 
     return res.json({
-      invoice,
-      items: itemsRes.rows,
-      payments: paymentsRes.rows
+      invoice: invData,
+      items: formattedItems,
+      payments: formattedPayments
     });
   } catch (error) {
     console.error(`Get Invoice Details Error: ${error.message}`);
@@ -215,31 +222,23 @@ const generateInvoicePDFAndSave = async (req, res) => {
 
   try {
     // 1. Fetch details
-    const invoiceQuery = 'SELECT * FROM invoices WHERE id = $1 AND user_id = $2';
-    const invoiceRes = await db.query(invoiceQuery, [id, userId]);
-    if (invoiceRes.rowCount === 0) {
+    const invoice = await Invoice.findOne({ _id: id, user_id: userId });
+    if (!invoice) {
       return res.status(404).json({ message: 'Invoice not found or unauthorized.' });
     }
-    const invoice = invoiceRes.rows[0];
 
-    const clientQuery = 'SELECT * FROM clients WHERE id = $1';
-    const clientRes = await db.query(clientQuery, [invoice.client_id]);
-    const client = clientRes.rows[0];
-
-    const userQuery = 'SELECT name, email FROM users WHERE id = $1';
-    const userRes = await db.query(userQuery, [userId]);
-    const user = userRes.rows[0];
-
-    const itemsQuery = 'SELECT * FROM invoice_items WHERE invoice_id = $1';
-    const itemsRes = await db.query(itemsQuery, [id]);
-    const items = itemsRes.rows;
+    const client = await Client.findById(invoice.client_id);
+    const user = await User.findById(userId).select('name email');
+    const itemsDocs = await InvoiceItem.find({ invoice_id: id });
+    const items = itemsDocs.map(doc => doc.toObject());
 
     // 2. Generate PDF
     const pdfLocalPath = await generateInvoicePDF(invoice, items, client, user);
     const pdfUrl = await uploadPDF(pdfLocalPath);
 
     // 3. Update invoice record
-    await db.query('UPDATE invoices SET pdf_path = $1 WHERE id = $2', [pdfUrl, invoice.id]);
+    invoice.pdf_path = pdfUrl;
+    await invoice.save();
     
     // Clean up local file
     if (pdfLocalPath && fs.existsSync(pdfLocalPath)) {
@@ -262,24 +261,15 @@ const sendInvoiceByEmail = async (req, res) => {
 
   try {
     // 1. Fetch data
-    const invoiceQuery = 'SELECT * FROM invoices WHERE id = $1 AND user_id = $2';
-    const invoiceRes = await db.query(invoiceQuery, [id, userId]);
-    if (invoiceRes.rowCount === 0) {
+    const invoice = await Invoice.findOne({ _id: id, user_id: userId });
+    if (!invoice) {
       return res.status(404).json({ message: 'Invoice not found or unauthorized.' });
     }
-    const invoice = invoiceRes.rows[0];
 
-    const clientQuery = 'SELECT * FROM clients WHERE id = $1';
-    const clientRes = await db.query(clientQuery, [invoice.client_id]);
-    const client = clientRes.rows[0];
-
-    const userQuery = 'SELECT name, email FROM users WHERE id = $1';
-    const userRes = await db.query(userQuery, [userId]);
-    const user = userRes.rows[0];
-
-    const itemsQuery = 'SELECT * FROM invoice_items WHERE invoice_id = $1';
-    const itemsRes = await db.query(itemsQuery, [id]);
-    const items = itemsRes.rows;
+    const client = await Client.findById(invoice.client_id);
+    const user = await User.findById(userId).select('name email');
+    const itemsDocs = await InvoiceItem.find({ invoice_id: id });
+    const items = itemsDocs.map(doc => doc.toObject());
 
     // 2. Ensure PDF is generated and downloaded locally to send as attachment
     let pdfLocalPath = '';
@@ -315,17 +305,13 @@ const generateAIInvoice = async (req, res) => {
   }
 
   try {
-    // 1. Fetch Client and User details to ensure they exist & for PDF printing
-    const clientQuery = 'SELECT * FROM clients WHERE id = $1 AND user_id = $2';
-    const clientRes = await db.query(clientQuery, [client_id, userId]);
-    if (clientRes.rowCount === 0) {
+    // 1. Fetch Client and User details
+    const client = await Client.findOne({ _id: client_id, user_id: userId });
+    if (!client) {
       return res.status(404).json({ message: 'Client not found or unauthorized.' });
     }
-    const client = clientRes.rows[0];
 
-    const userQuery = 'SELECT name, email FROM users WHERE id = $1';
-    const userRes = await db.query(userQuery, [userId]);
-    const user = userRes.rows[0];
+    const user = await User.findById(userId).select('name email');
 
     // 2. Call AI service to draft items and suggestion
     console.log(`Processing AI Invoice request for Client: ${client.name} with prompt: "${prompt}"`);
@@ -369,50 +355,44 @@ const generateAIInvoice = async (req, res) => {
     });
 
     // 5. Save Invoice Record to DB
-    const insertInvoiceQuery = `
-      INSERT INTO invoices (user_id, invoice_number, client_id, total_amount, gst_vat_amount, paid_amount, balance_amount, status, due_date)
-      VALUES ($1, $2, $3, $4, $5, 0.00, $4, 'Unpaid', $6)
-      RETURNING *
-    `;
-    const invoiceResult = await db.query(insertInvoiceQuery, [
-      userId,
-      invoiceNumber,
+    const invoice = new Invoice({
+      user_id: userId,
+      invoice_number: invoiceNumber,
       client_id,
-      totalAmount,
-      gstVatAmount,
-      dueDate
-    ]);
-    const createdInvoice = invoiceResult.rows[0];
+      total_amount: totalAmount,
+      gst_vat_amount: gstVatAmount,
+      paid_amount: 0.00,
+      balance_amount: totalAmount,
+      status: 'Unpaid',
+      due_date: dueDate
+    });
+    await invoice.save();
 
     // 6. Save Line Items to DB
     const itemPromises = itemsWithCalculatedAmounts.map(item => {
-      const insertItemQuery = `
-        INSERT INTO invoice_items (invoice_id, description, quantity, rate, gst_vat_percentage, amount)
-        VALUES ($1, $2, $3, $4, $5, $6)
-        RETURNING *
-      `;
-      return db.query(insertItemQuery, [
-        createdInvoice.id,
-        item.description,
-        item.quantity,
-        item.rate,
-        item.gst_vat_percentage,
-        item.amount
-      ]);
+      const invoiceItem = new InvoiceItem({
+        invoice_id: invoice._id,
+        description: item.description,
+        quantity: item.quantity,
+        rate: item.rate,
+        gst_vat_percentage: item.gst_vat_percentage,
+        amount: item.amount
+      });
+      return invoiceItem.save();
     });
-    const itemsResult = await Promise.all(itemPromises);
-    const savedItems = itemsResult.map(res => res.rows[0]);
+    const savedItemsDocs = await Promise.all(itemPromises);
+    const savedItems = savedItemsDocs.map(doc => doc.toObject());
 
     // 7. Generate PDF in background/immediately
     let pdfLocalPath = '';
     let pdfUrl = '';
     try {
-      pdfLocalPath = await generateInvoicePDF(createdInvoice, savedItems, client, user);
+      pdfLocalPath = await generateInvoicePDF(invoice, savedItems, client, user);
       pdfUrl = await uploadPDF(pdfLocalPath);
       
       // Update Invoice PDF URL
-      await db.query('UPDATE invoices SET pdf_path = $1 WHERE id = $2', [pdfUrl, createdInvoice.id]);
-      createdInvoice.pdf_path = pdfUrl;
+      invoice.pdf_path = pdfUrl;
+      await invoice.save();
     } catch (pdfErr) {
       console.error(`Automated PDF Generation failed inside AI creation pipeline: ${pdfErr.message}`);
     } finally {
@@ -421,6 +401,10 @@ const generateAIInvoice = async (req, res) => {
         try { fs.unlinkSync(pdfLocalPath); } catch (e) {}
       }
     }
+
+    const createdInvoice = invoice.toObject();
+    createdInvoice.id = createdInvoice._id;
+    savedItems.forEach(i => i.id = i._id);
 
     return res.status(201).json({
       message: 'AI Invoice created successfully!',
